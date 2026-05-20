@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# RUN_RUNTIME
+# Orchestrates the CDP Runtime + CFM cluster deployment on the manager host.
+#
+# Prerequisites:
+#   - cloudera-install-nonfips RUN_MANAGER has completed successfully
+#   - CM is running at http://<MANAGER_HOST>:7180
+#   - All agent hosts have been registered in CM
+#   - EXPORTS in this repo has been updated (CDH_BUILD in particular)
+#
+# Usage:
+#   cd /root/cloudera-runtime-install
+#   source ./EXPORTS
+#   sudo -E ./RUN_RUNTIME
+#
+# If 01_install_jdbc_driver.sh needs to run on a separate agent host, run it
+# there manually before executing this wrapper:
+#   sudo -E bash 01_install_jdbc_driver.sh
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+# Require credentials from the environment (set via EXPORTS before sudo -E).
+: "${CLOUDERA_REPO_USER:?Set CLOUDERA_REPO_USER in EXPORTS and run: source ./EXPORTS}"
+: "${CLOUDERA_REPO_PASS:?Set CLOUDERA_REPO_PASS in EXPORTS and run: source ./EXPORTS}"
+: "${MANAGER_HOST:?Set MANAGER_HOST in EXPORTS and run: source ./EXPORTS}"
+
+echo "======================================================================"
+echo "  cloudera-runtime-install: CDP Runtime + CFM + CSA deployment"
+echo "  Manager  : ${MANAGER_HOST}"
+echo "  Cluster  : ${CLUSTER_NAME:-CDPCluster}"
+echo "  Host     : ${CLUSTER_HOST:-<see EXPORTS>}"
+echo "  CDH Build: ${CDH_BUILD:-<see EXPORTS>}"
+echo "  CSA Build: ${CSA_FLINK_BUILD:-<see EXPORTS>}"
+echo "======================================================================"
+echo ""
+
+run_step() {
+  local step="$1"; shift
+  echo "----------------------------------------------------------------------"
+  echo "  Running: ${step}"
+  echo "----------------------------------------------------------------------"
+  sudo -E bash "${SCRIPT_DIR}/${step}" "$@"
+  echo ""
+}
+
+run_step 00_create_service_databases.sh
+run_step 01_install_jdbc_driver.sh
+run_step 02_setup_cms.sh
+run_step 03_install_csa_csds.sh
+run_step 04_deploy_cluster.sh
+run_step 05_validate_runtime.sh
+
+echo "======================================================================"
+echo "  RUN_RUNTIME complete."
+echo "  CDP cluster and CFM services are deployed."
+echo ""
+echo "  Cloudera Manager : http://${MANAGER_HOST}:7180"
+echo "  NiFi             : http://${CLUSTER_HOST:-$MANAGER_HOST}:8080/nifi"
+echo "  NiFi Registry    : http://${CLUSTER_HOST:-$MANAGER_HOST}:18080/nifi-registry"
+echo "  Hue              : http://${CLUSTER_HOST:-$MANAGER_HOST}:8888"
+echo "  SQL Stream Builder: http://${CLUSTER_HOST:-$MANAGER_HOST}:18121"
+echo "======================================================================"

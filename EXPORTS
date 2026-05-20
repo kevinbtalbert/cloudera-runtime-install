@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# CDP Runtime install configuration
+# Extends cloudera-install-nonfips EXPORTS with cluster-level settings.
+# Target: RHEL 9.x, CM 7.13.2, CDP 7.3.2, CFM 4.12 (NiFi 2.x), CSA 1.17 (Flink)
+# ==============================================================================
+
+# Path to the base install kit EXPORTS file.
+# Adjust if the base kit was staged to a different location.
+PARENT_EXPORTS="${PARENT_EXPORTS:-/root/cloudera-install-nonfips/EXPORTS}"
+if [[ -f "${PARENT_EXPORTS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${PARENT_EXPORTS}"
+else
+  echo "[WARN] Parent EXPORTS not found at ${PARENT_EXPORTS}. Set PARENT_EXPORTS to override."
+fi
+
+# ---- Cloudera Manager admin credentials ----
+# CM defaults to admin/admin after a fresh install.
+# Update CM_ADMIN_PASS here if the password has been changed.
+export CM_ADMIN_USER='admin'
+export CM_ADMIN_PASS='admin'
+
+# ---- CDP Runtime (CDH) parcel ----
+# Parcel repo: https://archive.cloudera.com/p/cdh7/7.3.2.0/parcels/
+# CDH_VERSION  - version string used in the CM cluster template cdhVersion field
+#                (matches the parcel filename prefix, e.g. CDH-7.3.2-...)
+# CDH_BUILD    - full parcel version string from the parcel filename,
+#                omitting the OS suffix (-el9.parcel)
+# CDH_PARCEL_REPO - URL of the parcel repository directory (trailing slash required)
+export CDH_VERSION='7.3.2'
+export CDH_BUILD='7.3.2-1.cdh7.3.2.p0.77083870'
+export CDH_PARCEL_REPO='https://archive.cloudera.com/p/cdh7/7.3.2.0/parcels/'
+
+# ---- CFM parcel build ----
+# Must match the CSD jars already installed by the base kit (13_install_cfm_csds.sh).
+# CFM_PARCEL_DIR_NAME is set in the base EXPORTS as 'CFM-4.12.0.1-8'.
+export CFM_BUILD="${CFM_PARCEL_DIR_NAME:-CFM-4.12.0.1-8}"
+
+# ---- Cluster identity ----
+# CLUSTER_NAME is the display name of the CDP cluster in Cloudera Manager.
+# CLUSTER_HOST defaults to AGENT_HOST set in the base EXPORTS.
+# Override here only if the cluster services should run on a different host.
+export CLUSTER_NAME='CDPCluster'
+export CLUSTER_HOST="${AGENT_HOST:-${MANAGER_HOST:-localhost}}"
+
+# ---- NiFi Java home ----
+# NiFi 2.x (CFM 4.x) requires Java 21.  Set this to the Java 21 installation
+# path on CLUSTER_HOST.  The generic symlink on RHEL 9 is usually:
+#   /usr/lib/jvm/java-21-openjdk
+# If the symlink does not exist, use the full versioned path, e.g.:
+#   /usr/lib/jvm/java-21-openjdk-21.0.x.x-x.el9.x86_64
+export NIFI_JAVA_HOME='/usr/lib/jvm/java-21-openjdk'
+
+# ---- CSA (Cloudera Streaming Analytics) ----
+# CSA provides Apache Flink and SQL Stream Builder (SSB).
+# CSA_FLINK_BUILD matches the CSD JAR names and the parcel version string.
+# From: https://archive.cloudera.com/p/csa/1.17.0.0/csd/
+export CSA_VERSION='1.17.0.0'
+export CSA_FLINK_BUILD='1.20.1-csa1.17.0.0-77091851'
+export CSA_PARCEL_REPO="https://archive.cloudera.com/p/csa/${CSA_VERSION}/parcels/"
+export CSA_FLINK_CSD_JAR="FLINK-${CSA_FLINK_BUILD}.jar"
+export CSA_SSB_CSD_JAR="SQL_STREAM_BUILDER-${CSA_FLINK_BUILD}.jar"
+export CSA_CSD_BASE_URL="https://archive.cloudera.com/p/csa/${CSA_VERSION}/csd"
+
+# ---- SQL Stream Builder database ----
+export SSB_DB_NAME='ssb'
+export SSB_DB_USER='ssb'
+export SSB_DB_PASS='SSB_DB_2026'
+
+# ---- Logging ----
+# Inherits LOG_DIR from parent EXPORTS (/var/log/cloudera-bootstrap).
+export LOG_DIR="${LOG_DIR:-/var/log/cloudera-bootstrap}"
