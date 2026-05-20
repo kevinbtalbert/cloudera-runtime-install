@@ -53,8 +53,10 @@ fi
 
 _psql() {
   # Run psql as the postgres OS user.
-  # PGAPPNAME suppresses "could not change directory" by switching to a safe cwd.
-  sudo -u postgres bash -c "cd /tmp && psql $*"
+  # cd /tmp first (in a subshell) so postgres can access the working directory
+  # and we avoid "could not change directory" noise on every call.
+  # "$@" preserves quoting correctly — do not use $* here.
+  ( cd /tmp && sudo -u postgres psql "$@" )
 }
 
 create_db() {
