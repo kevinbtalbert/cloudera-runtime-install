@@ -5,15 +5,34 @@
 # Target: RHEL 9.x, CM 7.13.2, CDP 7.3.2, CFM 4.12 (NiFi 2.x), CSA 1.17 (Flink)
 # ==============================================================================
 
-# Path to the base install kit EXPORTS file.
-# Adjust if the base kit was staged to a different location.
-PARENT_EXPORTS="${PARENT_EXPORTS:-/root/cloudera-install-nonfips/EXPORTS}"
-if [[ -f "${PARENT_EXPORTS}" ]]; then
+# Locate the base install kit EXPORTS file automatically.
+# Search order:
+#   1. One directory up from this repo (relative — handles any user/path layout)
+#   2. PARENT_EXPORTS env var (explicit override)
+#   3. /root path (fallback for root-based installs)
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_PARENT_CANDIDATES=(
+  "${_SELF_DIR}/../cloudera-install-nonfips/EXPORTS"
+  "${_SELF_DIR}/../cloudera-install-nonfips-main/EXPORTS"
+  "${PARENT_EXPORTS:-}"
+  "/root/cloudera-install-nonfips/EXPORTS"
+  "/root/cloudera-install-nonfips-main/EXPORTS"
+)
+_FOUND_PARENT=""
+for _c in "${_PARENT_CANDIDATES[@]}"; do
+  if [[ -n "${_c}" && -f "${_c}" ]]; then
+    _FOUND_PARENT="${_c}"
+    break
+  fi
+done
+
+if [[ -n "${_FOUND_PARENT}" ]]; then
   # shellcheck disable=SC1090
-  source "${PARENT_EXPORTS}"
+  source "${_FOUND_PARENT}"
 else
-  echo "[WARN] Parent EXPORTS not found at ${PARENT_EXPORTS}. Set PARENT_EXPORTS to override."
+  echo "[WARN] Parent EXPORTS not found. Set PARENT_EXPORTS=/path/to/cloudera-install-nonfips/EXPORTS and re-source."
 fi
+unset _SELF_DIR _PARENT_CANDIDATES _FOUND_PARENT _c
 
 # ---- Cloudera Manager admin credentials ----
 # CM defaults to admin/admin after a fresh install.

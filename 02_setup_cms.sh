@@ -122,19 +122,36 @@ START_CMD_ID=$(echo "${START_RESP}" | jq -r '.id' 2>/dev/null || echo "")
 if [[ -z "${START_CMD_ID}" || "${START_CMD_ID}" == "null" ]]; then
   echo "[WARN] Could not retrieve start command ID; CMS may already be running."
 else
-  wait_for_command "${CM_API_BASE}" "${START_CMD_ID}" 300
+  # CMS first-start includes schema initialisation for ReportsManager and
+  # LevelDB setup for ServiceMonitor/HostMonitor — allow up to 15 minutes.
+  wait_for_command "${CM_API_BASE}" "${START_CMD_ID}" 900 || true
 fi
 
 # ---------------------------------------------------------------------------
 # Verify CMS is running
+# Regardless of command timeout, poll the actual service state so we fail
+# only when CMS is genuinely not up.
 # ---------------------------------------------------------------------------
 
-sleep 5
-CMS_STATE=$(cm_curl "${CM_API_BASE}/cm/service" | jq -r '.serviceState // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
-echo "[INFO] CMS service state: ${CMS_STATE}"
+echo "[INFO] Waiting for CMS service state to reach STARTED ..."
+CMS_WAIT=0
+CMS_MAX=180
+while [[ "${CMS_WAIT}" -lt "${CMS_MAX}" ]]; do
+  CMS_STATE=$(cm_curl "${CM_API_BASE}/cm/service" \
+    | jq -r '.serviceState // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+  if [[ "${CMS_STATE}" == "STARTED" ]]; then
+    echo "[INFO] CMS service state: STARTED"
+    break
+  fi
+  sleep 10
+  CMS_WAIT=$((CMS_WAIT + 10))
+  echo "[INFO] CMS state: ${CMS_STATE} (${CMS_WAIT}s elapsed) ..."
+done
 
 if [[ "${CMS_STATE}" != "STARTED" ]]; then
-  echo "[WARN] CMS state is '${CMS_STATE}'; it may still be starting.  Check CM UI if services fail."
+  echo "[ERROR] CMS did not reach STARTED state within $((900 + CMS_MAX))s." >&2
+  echo "[ERROR] Check CM UI → Cloudera Management Service for role failures." >&2
+  exit 1
 fi
 
 echo "[INFO] 02_setup_cms: complete."

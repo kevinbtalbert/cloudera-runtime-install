@@ -51,30 +51,32 @@ fi
 # Uses -Atc (unaligned, tuples-only) for a clean empty-or-1 result.
 # ---------------------------------------------------------------------------
 
+_psql() {
+  # Run psql as the postgres OS user.
+  # PGAPPNAME suppresses "could not change directory" by switching to a safe cwd.
+  sudo -u postgres bash -c "cd /tmp && psql $*"
+}
+
 create_db() {
   local db_name="$1"
   local db_user="$2"
   local db_pass="$3"
 
   local role_exists db_exists
-  role_exists=$(sudo -u postgres psql -Atc \
-    "SELECT 1 FROM pg_roles WHERE rolname='${db_user}'" 2>/dev/null || echo "")
+  role_exists=$(_psql -Atc "SELECT 1 FROM pg_roles WHERE rolname='${db_user}'" 2>/dev/null || echo "")
   if [[ "${role_exists}" == "1" ]]; then
     echo "[INFO]   role '${db_user}': already exists"
   else
     echo "[INFO]   role '${db_user}': creating ..."
-    sudo -u postgres psql -c \
-      "CREATE ROLE ${db_user} WITH LOGIN PASSWORD '${db_pass}';"
+    _psql -c "CREATE ROLE ${db_user} WITH LOGIN PASSWORD '${db_pass}';" 2>/dev/null
   fi
 
-  db_exists=$(sudo -u postgres psql -Atc \
-    "SELECT 1 FROM pg_database WHERE datname='${db_name}'" 2>/dev/null || echo "")
+  db_exists=$(_psql -Atc "SELECT 1 FROM pg_database WHERE datname='${db_name}'" 2>/dev/null || echo "")
   if [[ "${db_exists}" == "1" ]]; then
     echo "[INFO]   database '${db_name}': already exists"
   else
     echo "[INFO]   database '${db_name}': creating ..."
-    sudo -u postgres psql -c \
-      "CREATE DATABASE ${db_name} OWNER ${db_user} ENCODING 'UTF8';"
+    _psql -c "CREATE DATABASE ${db_name} OWNER ${db_user} ENCODING 'UTF8';" 2>/dev/null
   fi
 }
 
@@ -167,9 +169,8 @@ fi
 
 echo ""
 echo "[INFO] All service databases verified.  Current database list:"
-sudo -u postgres psql -Atc \
-  "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;" \
-  | sed 's/^/[INFO]   /'
+_psql -Atc "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;" \
+  2>/dev/null | sed 's/^/[INFO]   /'
 
 echo ""
 echo "[INFO] 00_create_service_databases: complete."
