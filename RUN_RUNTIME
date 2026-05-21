@@ -52,8 +52,9 @@ run_step 00_create_service_databases.sh
 run_step 01_install_jdbc_driver.sh
 run_step 02_setup_cms.sh
 run_step 03_install_csa_csds.sh
-run_step 04_deploy_cluster.sh
-run_step 05_validate_runtime.sh
+run_step 04_stage_parcels.sh
+run_step 05_deploy_cluster.sh
+run_step 06_validate_runtime.sh
 
 echo "======================================================================"
 echo "  RUN_RUNTIME complete."

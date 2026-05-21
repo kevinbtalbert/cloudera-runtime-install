@@ -32,29 +32,39 @@ require_cmd curl
 : "${CSA_SSB_CSD_JAR:?CSA_SSB_CSD_JAR must be set in EXPORTS}"
 
 CSD_DIR='/opt/cloudera/csd'
-MIN_JAR_BYTES=51200   # 50 KB minimum sanity check
 CM_RESTART_WAIT_SECONDS="${CM_RESTART_WAIT_SECONDS:-120}"
 
 # ---------------------------------------------------------------------------
-# Helper: download a CSD JAR from the authenticated Cloudera archive
+# Helper: download a CSD JAR from the authenticated Cloudera archive.
+# Credentials are embedded in the URL so they survive HTTP redirects —
+# the Cloudera archive redirects through SSO and loses Basic Auth headers
+# passed via -u, but URL-embedded credentials persist through redirects.
 # ---------------------------------------------------------------------------
 
 download_csd() {
   local jar_name="$1"
   local dest="${CSD_DIR}/${jar_name}"
-  local url="${CSA_CSD_BASE_URL}/${jar_name}"
+
+  # Build URL with credentials embedded: https://USER:PASS@host/path
+  local base_no_scheme="${CSA_CSD_BASE_URL#https://}"
+  local url="https://${CLOUDERA_REPO_USER}:${CLOUDERA_REPO_PASS}@${base_no_scheme}/${jar_name}"
 
   echo "[INFO] Downloading ${jar_name} ..."
   curl -fSL --progress-bar \
-       -u "${CLOUDERA_REPO_USER}:${CLOUDERA_REPO_PASS}" \
        -o "${dest}.tmp" \
        "${url}"
 
-  # Validate size
-  local size
-  size=$(stat -c '%s' "${dest}.tmp" 2>/dev/null || stat -f '%z' "${dest}.tmp" 2>/dev/null || echo 0)
-  if [[ "${size}" -lt "${MIN_JAR_BYTES}" ]]; then
-    echo "[ERROR] ${jar_name} is too small (${size} bytes); download may have failed." >&2
+  # Validate the file is a real JAR: JARs are ZIP files and start with PK\x03\x04
+  local magic
+  magic=$(python3 -c "
+with open('${dest}.tmp', 'rb') as f:
+    print(f.read(4).hex())
+" 2>/dev/null || echo "")
+
+  if [[ "${magic}" != "504b0304" ]]; then
+    echo "[ERROR] ${jar_name} is not a valid JAR (magic bytes: ${magic})." >&2
+    echo "[ERROR] Expected 504b0304 (ZIP/JAR). Got an error page — check credentials and URL." >&2
+    echo "[ERROR] URL (redacted): ${CSA_CSD_BASE_URL}/${jar_name}" >&2
     rm -f "${dest}.tmp"
     exit 1
   fi

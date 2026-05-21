@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 04_deploy_cluster.sh
+# 05_deploy_cluster.sh
 # Deploys the CDP Runtime cluster and CFM (NiFi / NiFi Registry) services by:
 #   1. Validating required variables
 #   2. Substituting environment variables into the cluster template
@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
 
-log_init "04_deploy_cluster"
+log_init "05_deploy_cluster"
 need_root
 require_cmd curl
 require_cmd jq
@@ -171,5 +171,5 @@ cm_curl "${CM_API_BASE}/cm/config" \
       ]}' \
   > /dev/null
 
-echo "[INFO] 04_deploy_cluster: complete."
-echo "[INFO] CDP cluster '${CLUSTER_NAME}' is deployed.  Run 05_validate_runtime.sh to verify."
+echo "[INFO] 05_deploy_cluster: complete."
+echo "[INFO] CDP cluster '${CLUSTER_NAME}' is deployed.  Run 06_validate_runtime.sh to verify."

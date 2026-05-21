@@ -52,9 +52,11 @@ export CDH_BUILD='7.3.2-1.cdh7.3.2.p0.77083870'
 export CDH_PARCEL_REPO='https://archive.cloudera.com/p/cdh7/7.3.2.0/parcels/'
 
 # ---- CFM parcel build ----
-# Must match the CSD jars already installed by the base kit (13_install_cfm_csds.sh).
-# CFM_PARCEL_DIR_NAME is set in the base EXPORTS as 'CFM-4.12.0.1-8'.
-export CFM_BUILD="${CFM_PARCEL_DIR_NAME:-CFM-4.12.0.1-8}"
+# CFM_PARCEL_DIR_NAME (from base EXPORTS) is the activated parcel directory name,
+# e.g. "CFM-4.12.0.1-9".  The cluster template products.version needs only the
+# numeric part without the "CFM-" prefix, e.g. "4.12.0.1-9".
+# Strip the prefix here so the template version matches what CM reports for the parcel.
+export CFM_BUILD="${CFM_PARCEL_DIR_NAME#CFM-}"
 
 # ---- Cluster identity ----
 # CLUSTER_NAME is the display name of the CDP cluster in Cloudera Manager.

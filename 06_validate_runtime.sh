@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 05_validate_runtime.sh
+# 06_validate_runtime.sh
 # Validates the deployed CDP + CFM cluster by:
 #   - Querying CM for the cluster and service health status
 #   - Verifying key TCP ports are open
@@ -197,4 +197,4 @@ if [[ "${WARN}" -gt 0 ]]; then
   echo "[WARN] ${WARN} check(s) require attention."
 fi
 
-echo "[INFO] 05_validate_runtime: complete."
+echo "[INFO] 06_validate_runtime: complete."
