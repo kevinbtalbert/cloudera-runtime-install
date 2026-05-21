@@ -280,10 +280,16 @@ _apply_kafka_fixes() {
   local cluster="${2:-${CLUSTER_ENCODED}}"
 
   # Fix 1: CM defaults metadata.store to KRaft; ZooKeeper mode is required here.
+  # Also disable ZooKeeper SASL auth — both default to KRaft/true and break
+  # Kafka in non-Kerberos setups.
   cm_curl \
     "${api_base}/clusters/${cluster}/services/kafka/roleConfigGroups/kafka-KAFKA_BROKER-BASE/config" \
     -X PUT \
-    -d '{"items": [{"name": "metadata.store", "value": "Zookeeper"}]}' \
+    -d '{"items": [
+      {"name": "metadata.store",                  "value": "Zookeeper"},
+      {"name": "authenticate.zookeeper.connection","value": "false"},
+      {"name": "zookeeper.set.acl",               "value": "false"}
+    ]}' \
     > /dev/null 2>&1 || true
 
   # Fix 2: zookeeper.secure.connection.enable must match ZooKeeper's actual
