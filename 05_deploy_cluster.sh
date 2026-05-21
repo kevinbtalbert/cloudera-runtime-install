@@ -111,20 +111,37 @@ CM_API_BASE="http://${MANAGER_HOST}:7180/api/${CM_API_VERSION}"
 echo "[INFO] Using CM API: ${CM_API_BASE}"
 
 # ---------------------------------------------------------------------------
-# Check whether the cluster already exists.
-# If it exists but contains only CORE_SETTINGS (stub from a failed previous
-# import), delete it automatically so this run can start fresh.
-# A fully deployed cluster is left untouched — exit 0 to skip.
+# Pre-import preparation
+#
+# EVERYTHING below runs BEFORE importClusterTemplate is submitted.
+# Once the import starts it cannot be influenced — all state must be correct.
 # ---------------------------------------------------------------------------
 
 CLUSTER_ENCODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${CLUSTER_NAME}")
-CLUSTER_STATUS=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}" \
-  -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+
+# Helper: clean comma-separated HDFS directories
+_clean_hdfs_dirs() {
+  local dir_list="$1"
+  IFS=',' read -ra _dirs <<< "${dir_list}"
+  for _d in "${_dirs[@]}"; do
+    _d="${_d// /}"
+    [[ -z "${_d}" ]] && continue
+    if [[ -d "${_d}" ]]; then
+      rm -rf "${_d}"
+      echo "[INFO]   Cleaned: ${_d}"
+    fi
+  done
+}
+
+# Default HDFS dir paths (overridden below if cluster exists in CM)
+_hdfs_nn_dirs="/dfs/nn"
+_hdfs_snn_dirs="/dfs/snn"
+_hdfs_dn_dirs="/dfs/dn"
+
+CLUSTER_STATUS=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}"   -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
 
 if [[ "${CLUSTER_STATUS}" == "200" ]]; then
-  # Count how many non-CORE_SETTINGS services the cluster has
-  SERVICE_COUNT=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services" \
-    | jq '[.items[] | select(.type != "CORE_SETTINGS")] | length' 2>/dev/null || echo "0")
+  SERVICE_COUNT=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services"     | jq '[.items[] | select(.type != "CORE_SETTINGS")] | length' 2>/dev/null || echo "0")
 
   if [[ "${SERVICE_COUNT}" -gt 0 ]]; then
     echo "[INFO] Cluster '${CLUSTER_NAME}' already exists with ${SERVICE_COUNT} deployed service(s)."
@@ -132,87 +149,93 @@ if [[ "${CLUSTER_STATUS}" == "200" ]]; then
     exit 0
   fi
 
-  echo "[WARN] Cluster '${CLUSTER_NAME}' exists but has no deployed services (stub from a failed run)."
-  echo "[WARN] Deleting stub cluster and redeploying ..."
+  echo "[WARN] Stub cluster detected.  Querying HDFS paths before deletion ..."
 
-  # Stop any active commands on the cluster before deleting
+  # Query actual HDFS paths BEFORE deleting (while CM service configs are queryable)
+  _hdfs_nn_dirs=$(cm_curl     "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-NAMENODE-BASE/config"     2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_name_dir_list")) | .[0].value // "/dfs/nn"'     2>/dev/null || echo "/dfs/nn")
+  _hdfs_snn_dirs=$(cm_curl     "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-SECONDARYNAMENODE-BASE/config"     2>/dev/null | jq -r '(.items//[]) | map(select(.name=="fs_checkpoint_dir_list")) | .[0].value // "/dfs/snn"'     2>/dev/null || echo "/dfs/snn")
+  _hdfs_dn_dirs=$(cm_curl     "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-DATANODE-BASE/config"     2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_data_dir_list")) | .[0].value // "/dfs/dn"'     2>/dev/null || echo "/dfs/dn")
+
+  # Now delete the stub cluster
   cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/commands/stop" -X POST > /dev/null 2>&1 || true
   sleep 5
-
   DELETE_RESP=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}" -X DELETE)
   if echo "${DELETE_RESP}" | jq -e '.message' &>/dev/null; then
-    # CM returned an error message — may still have active commands; wait and retry once
     sleep 15
     cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}" -X DELETE > /dev/null 2>&1 || true
   fi
-  # Query the actual HDFS directory paths from CM *before* we delete the cluster.
-  # CM stores dirs as comma-separated lists.  The values are set on the role
-  # config groups; we default to the CM-standard paths if a query fails.
-  echo "[INFO] Querying HDFS directory paths from CM ..."
-  _hdfs_nn_dirs=$(cm_curl \
-    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-NAMENODE-BASE/config" \
-    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_name_dir_list")) | .[0].value // "/dfs/nn"' \
-    2>/dev/null || echo "/dfs/nn")
-  _hdfs_snn_dirs=$(cm_curl \
-    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-SECONDARYNAMENODE-BASE/config" \
-    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="fs_checkpoint_dir_list")) | .[0].value // "/dfs/snn"' \
-    2>/dev/null || echo "/dfs/snn")
-  _hdfs_dn_dirs=$(cm_curl \
-    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-DATANODE-BASE/config" \
-    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_data_dir_list")) | .[0].value // "/dfs/dn"' \
-    2>/dev/null || echo "/dfs/dn")
-  echo "[INFO] HDFS NameNode dirs        : ${_hdfs_nn_dirs}"
-  echo "[INFO] HDFS SecondaryNameNode dirs: ${_hdfs_snn_dirs}"
-  echo "[INFO] HDFS DataNode dirs        : ${_hdfs_dn_dirs}"
-
   echo "[INFO] Stub cluster deleted."
-
-  # Clean ALL HDFS on-disk state for a clean retry.
-  #
-  # When a previous import formatted the NameNode and then failed later (e.g.
-  # Kafka issues), we end up with NameNode dirs formatted with cluster ID X and
-  # DataNode dirs with VERSION files also referencing cluster ID X.  On retry,
-  # HDFS format generates a NEW cluster ID Y — the DataNode then rejects the
-  # NameNode (X≠Y) and crashes ("Supervisor FATAL").
-  #
-  # Fix: clean NN + SNN + DN together so all three get the same new cluster ID.
-  # Safe here because we confirmed the cluster is a stub (CORE_SETTINGS only).
-  echo "[INFO] Cleaning HDFS on-disk state (NN + SNN + DN) for clean retry ..."
-
-  _clean_hdfs_dirs() {
-    # Takes a comma-separated list of paths and removes each
-    local dir_list="$1"
-    IFS=',' read -ra _dirs <<< "${dir_list}"
-    for _d in "${_dirs[@]}"; do
-      _d="${_d// /}"   # trim spaces
-      [[ -z "${_d}" ]] && continue
-      if [[ -d "${_d}" ]]; then
-        rm -rf "${_d}"
-        echo "[INFO]   Removed: ${_d}"
-      fi
-    done
-  }
-
-  _clean_hdfs_dirs "${_hdfs_nn_dirs}"
-  _clean_hdfs_dirs "${_hdfs_snn_dirs}"
-  _clean_hdfs_dirs "${_hdfs_dn_dirs}"
-
-  # Wait for CM to finish any residual parcel distribution that was started by
-  # the previous import.  Parcel distribution runs against the hosts, not the
-  # cluster object, so it survives cluster deletion.  Starting a new import
-  # while a distribution is still running causes "concurrent action" errors.
-  echo "[INFO] Waiting for any residual parcel operations to clear (up to 180s) ..."
-  sleep 120
 fi
 
 # ---------------------------------------------------------------------------
-# Wait for CM parcel operations to be idle before starting the import
+# On-disk state cleanup — runs BEFORE importClusterTemplate is submitted.
+#
+# FAILURE RECOVERY: If deployment fails and you need to start over:
+#   1. Delete the cluster in CM (or let this script detect it as a stub)
+#   2. Run this script again — it detects and cleans stale on-disk state
+#   3. Do NOT intervene once importClusterTemplate is running
+#
+# Manual recovery (run as root on the cluster host if the script can't clean):
+#   rm -rf /dfs/nn /dfs/snn /dfs/dn /var/lib/zookeeper
+#   Then delete the cluster in CM and re-run this script.
+#
+# What is cleaned and why:
+#
+#   HDFS (NN + SNN + DN): a previous import may have formatted HDFS and then
+#   failed on a later service (e.g. Kafka config).  The next import refuses to
+#   re-format non-empty dirs.  NN+SNN+DN must be cleaned together — a cluster
+#   ID mismatch between them causes DataNode "Supervisor FATAL" crash loops.
+#
+#   ZooKeeper data dir: ZooKeeper persists state across restarts.  Stale Kafka
+#   chroot data (/kafka/cluster/id, /kafka/brokers, etc.) from a previous
+#   deployment survives into the next firstRun and can cause Kafka broker
+#   startup failures.  Cleaning ZooKeeper ensures a truly fresh start.
 # ---------------------------------------------------------------------------
-# CM's parcel distribution locks are global.  If a previous import left a
-# distribution in-flight, the new import will fail immediately with a
-# "concurrent action" error.  Poll for up to 3 minutes until no parcel is
-# in a transitional state (DOWNLOADING / DISTRIBUTING / ACTIVATING).
 
+echo "[INFO] Pre-import: checking on-disk state ..."
+echo "[INFO]   HDFS NN dirs:   ${_hdfs_nn_dirs}"
+echo "[INFO]   HDFS SNN dirs:  ${_hdfs_snn_dirs}"
+echo "[INFO]   HDFS DN dirs:   ${_hdfs_dn_dirs}"
+
+# ZooKeeper data dir (query from CM while cluster exists, else use default)
+_zk_data_dir="/var/lib/zookeeper"
+if [[ "${CLUSTER_STATUS}" == "200" ]]; then
+  _zk_data_dir_queried=$(cm_curl \
+    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/zookeeper/roleConfigGroups/zookeeper-SERVER-BASE/config" \
+    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dataDir")) | .[0].value // ""' \
+    2>/dev/null || echo "")
+  [[ -n "${_zk_data_dir_queried}" ]] && _zk_data_dir="${_zk_data_dir_queried}"
+fi
+echo "[INFO]   ZooKeeper data: ${_zk_data_dir}"
+
+_needs_clean=false
+IFS=',' read -ra _nn_check_arr <<< "${_hdfs_nn_dirs}"
+for _d in "${_nn_check_arr[@]}"; do
+  _d="${_d// /}"
+  if [[ -d "${_d}/current" ]]; then
+    echo "[WARN] Stale HDFS data found at ${_d}/current — will clean NN+SNN+DN+ZK."
+    _needs_clean=true
+    break
+  fi
+done
+
+if [[ "${_needs_clean}" == "true" ]]; then
+  _clean_hdfs_dirs "${_hdfs_nn_dirs}"
+  _clean_hdfs_dirs "${_hdfs_snn_dirs}"
+  _clean_hdfs_dirs "${_hdfs_dn_dirs}"
+  if [[ -d "${_zk_data_dir}" ]]; then
+    rm -rf "${_zk_data_dir}"
+    echo "[INFO]   Cleaned ZooKeeper: ${_zk_data_dir}"
+  fi
+  echo "[INFO] On-disk state cleaned — ready for fresh import."
+else
+  echo "[INFO] On-disk state is clean."
+fi
+
+# Wait for residual parcel operations from any previous import to clear before
+# starting a new one (concurrent parcel distribution causes "concurrent action" errors).
+echo "[INFO] Waiting 120s for residual parcel operations to clear ..."
+sleep 120
 _wait_parcels_idle() {
   local waited=0
   local max_wait=180
