@@ -54,6 +54,9 @@ authed_url() {
 # ---------------------------------------------------------------------------
 # Helper: fetch manifest.json and return the parcel filename for our OS
 # that matches the given version string.
+# The manifest is written to a temp file so Python reads it directly — this
+# avoids control-character corruption that happens when JSON is expanded
+# inside a shell heredoc or string literal.
 # ---------------------------------------------------------------------------
 
 find_parcel_name() {
@@ -62,23 +65,38 @@ find_parcel_name() {
   local repo_url="$3"  # e.g. https://archive.cloudera.com/p/cdh7/.../parcels/
 
   echo "[INFO] Fetching manifest: ${repo_url}manifest.json ..." >&2
-  local manifest
-  manifest=$(curl -fsSL "$(authed_url "${repo_url}")manifest.json") || {
+
+  local manifest_file
+  manifest_file=$(mktemp /tmp/parcel_manifest.XXXXXX.json)
+
+  curl -fsSL "$(authed_url "${repo_url}")manifest.json" \
+       -o "${manifest_file}" 2>/dev/null || {
+    rm -f "${manifest_file}"
     echo "[ERROR] Could not fetch manifest from ${repo_url}" >&2
     return 1
   }
 
-  python3 - <<EOF
+  local result
+  result=$(python3 - "${manifest_file}" "${version}" "${PARCEL_OS}" <<'PYEOF'
 import json, sys
-data = json.loads('''${manifest}''')
+manifest_file, version, os_suffix = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(manifest_file) as fh:
+    data = json.load(fh)
 for p in data.get('parcels', []):
     name = p.get('parcelName', '')
-    if '${version}' in name and '${PARCEL_OS}' in name:
+    if version in name and os_suffix in name:
         print(name)
         sys.exit(0)
-print('', end='')
 sys.exit(1)
-EOF
+PYEOF
+  ) || true
+
+  rm -f "${manifest_file}"
+
+  if [[ -z "${result}" ]]; then
+    return 1
+  fi
+  echo "${result}"
 }
 
 # ---------------------------------------------------------------------------
@@ -115,10 +133,12 @@ stage_parcel() {
 
     # Validate gzip magic bytes (1f 8b)
     local magic
-    magic=$(python3 -c "
-with open('${dest}.tmp', 'rb') as f:
+    magic=$(python3 - "${dest}.tmp" <<'PYEOF'
+import sys
+with open(sys.argv[1], 'rb') as f:
     print(f.read(2).hex())
-" 2>/dev/null || echo "")
+PYEOF
+    ) 2>/dev/null || magic=""
 
     if [[ "${magic}" != "1f8b" ]]; then
       echo "[ERROR] ${parcel_name}: not a valid parcel file (magic=${magic})." >&2

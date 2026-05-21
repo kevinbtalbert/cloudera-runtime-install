@@ -41,9 +41,17 @@ CM_RESTART_WAIT_SECONDS="${CM_RESTART_WAIT_SECONDS:-120}"
 # passed via -u, but URL-embedded credentials persist through redirects.
 # ---------------------------------------------------------------------------
 
+# Tracks whether any JAR was newly written this run.
+CSDS_CHANGED=0
+
 download_csd() {
   local jar_name="$1"
   local dest="${CSD_DIR}/${jar_name}"
+
+  if [[ -f "${dest}" ]]; then
+    echo "[INFO] ${jar_name}: already installed, skipping download."
+    return 0
+  fi
 
   # Build URL with credentials embedded: https://USER:PASS@host/path
   local base_no_scheme="${CSA_CSD_BASE_URL#https://}"
@@ -56,10 +64,12 @@ download_csd() {
 
   # Validate the file is a real JAR: JARs are ZIP files and start with PK\x03\x04
   local magic
-  magic=$(python3 -c "
-with open('${dest}.tmp', 'rb') as f:
+  magic=$(python3 - "${dest}.tmp" <<'PYEOF'
+import sys
+with open(sys.argv[1], 'rb') as f:
     print(f.read(4).hex())
-" 2>/dev/null || echo "")
+PYEOF
+  ) 2>/dev/null || magic=""
 
   if [[ "${magic}" != "504b0304" ]]; then
     echo "[ERROR] ${jar_name} is not a valid JAR (magic bytes: ${magic})." >&2
@@ -71,10 +81,11 @@ with open('${dest}.tmp', 'rb') as f:
 
   mv -f "${dest}.tmp" "${dest}"
   echo "[INFO] Installed: ${dest} ($(du -sh "${dest}" | cut -f1))"
+  CSDS_CHANGED=1
 }
 
 # ---------------------------------------------------------------------------
-# Download CSDs
+# Download CSDs (skipped per-file if already present)
 # ---------------------------------------------------------------------------
 
 mkdir -p "${CSD_DIR}"
@@ -83,24 +94,27 @@ download_csd "${CSA_FLINK_CSD_JAR}"
 download_csd "${CSA_SSB_CSD_JAR}"
 
 # ---------------------------------------------------------------------------
-# Fix ownership
+# Fix ownership on any file that was newly written
 # ---------------------------------------------------------------------------
 
 chown cloudera-scm:cloudera-scm "${CSD_DIR}/${CSA_FLINK_CSD_JAR}" \
                                  "${CSD_DIR}/${CSA_SSB_CSD_JAR}"
-echo "[INFO] Ownership set to cloudera-scm:cloudera-scm."
 
 # ---------------------------------------------------------------------------
-# Restart CM server so it scans the updated CSD directory
+# Restart CM server only if new CSD JARs were installed this run.
+# CM needs to rescan /opt/cloudera/csd after new JARs appear, but if both
+# JARs were already present from a previous run the restart is unnecessary.
 # ---------------------------------------------------------------------------
 
-echo "[INFO] Restarting cloudera-scm-server to load new CSDs ..."
-systemctl restart cloudera-scm-server
-
-echo "[INFO] Waiting ${CM_RESTART_WAIT_SECONDS}s for CM server to restart ..."
-sleep "${CM_RESTART_WAIT_SECONDS}"
-
-wait_for_cm 300
+if [[ "${CSDS_CHANGED}" -eq 1 ]]; then
+  echo "[INFO] New CSDs installed — restarting cloudera-scm-server to load them ..."
+  systemctl restart cloudera-scm-server
+  echo "[INFO] Waiting ${CM_RESTART_WAIT_SECONDS}s for CM server to restart ..."
+  sleep "${CM_RESTART_WAIT_SECONDS}"
+  wait_for_cm 300
+else
+  echo "[INFO] All CSD JARs were already present — skipping CM restart."
+fi
 
 # ---------------------------------------------------------------------------
 # Verify CSD directory

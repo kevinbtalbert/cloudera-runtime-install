@@ -272,13 +272,23 @@
       "refName": "kafka",
       "serviceType": "KAFKA",
       "displayName": "Kafka",
-      "serviceConfigs": [],
+      "serviceConfigs": [
+        {
+          "name": "zookeeper.secure.connection.enable",
+          "value": "${KAFKA_ZK_SECURE}"
+        }
+      ],
       "roleConfigGroups": [
         {
           "refName": "kafka-KAFKA_BROKER-BASE",
           "roleType": "KAFKA_BROKER",
           "base": true,
-          "configs": []
+          "configs": [
+            {
+              "name": "metadata.store",
+              "value": "Zookeeper"
+            }
+          ]
         }
       ]
     },
@@ -490,20 +500,7 @@
           "refName": "sql_stream_builder-STREAMING_SQL_ENGINE-BASE",
           "roleType": "STREAMING_SQL_ENGINE",
           "base": true,
-          "configs": [
-            {
-              "name": "ssb.datasource.url",
-              "value": "jdbc:postgresql://${DB_HOST}:${DB_PORT}/${SSB_DB_NAME}"
-            },
-            {
-              "name": "ssb.datasource.username",
-              "value": "${SSB_DB_USER}"
-            },
-            {
-              "name": "ssb.datasource.password",
-              "value": "${SSB_DB_PASS}"
-            }
-          ]
+          "configs": []
         }
       ]
     }

@@ -99,7 +99,58 @@ wait_for_cm() {
   exit 1
 }
 
-# Poll a CM command by ID until it finishes, then return 0 on success or 1 on failure.
+# Emit one progress line for a CM command response.
+# Shows step counts (done/total) and the name of the most recent active or
+# completed child step.  Works even when all children finished between polls.
+# Uses a temp file so the JSON is not embedded in shell/Python string literals.
+_cmd_progress_line() {
+  local resp="$1"
+  local _tmp
+  _tmp=$(mktemp /tmp/cm_cmd_resp.XXXXXX.json)
+  printf '%s' "${resp}" > "${_tmp}"
+
+  python3 - "${_tmp}" <<'PYEOF' 2>/dev/null
+import json, sys, os
+
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        d = json.load(fh)
+finally:
+    os.unlink(path)
+
+items = (d.get('children') or {}).get('items') or []
+if not items:
+    sys.exit(0)
+
+total    = len(items)
+done_ok  = sum(1 for c in items if c.get('active') == False and c.get('success') == True)
+done_bad = sum(1 for c in items if c.get('active') == False and c.get('success') == False)
+running  = [c for c in items if c.get('active') == True]
+
+def label(c):
+    parts = [c.get('name') or '']
+    svc  = (c.get('serviceRef') or {}).get('serviceName') or ''
+    role = (c.get('roleRef')    or {}).get('roleName')    or ''
+    if svc:  parts.append(f'[{svc}]')
+    if role: parts.append(f'/{role}')
+    return ' '.join(p for p in parts if p)
+
+if running:
+    msg = f'{done_ok}/{total} done | running: {label(running[-1])}'
+else:
+    completed = sorted([c for c in items if not c.get('active')],
+                       key=lambda c: c.get('endTime') or '')
+    last = label(completed[-1]) if completed else ''
+    fail_note = f' ({done_bad} failed)' if done_bad else ''
+    msg = f'{done_ok}/{total} done{fail_note}' + (f' | last: {last}' if last else '')
+
+print(msg)
+PYEOF
+}
+
+# Poll a CM command by ID until it finishes.  Prints step progress on each
+# interval so you can see what CM is working on.
 # Usage: wait_for_command <api_base_url> <command_id> [timeout_secs]
 wait_for_command() {
   require_cmd jq
@@ -114,7 +165,7 @@ wait_for_command() {
     local resp active success msg
     resp=$(cm_curl "${api_base}/commands/${cmd_id}") || true
 
-    active=$(echo "${resp}" | jq -r '.active // true' 2>/dev/null || echo "true")
+    active=$(echo "${resp}"  | jq -r '.active  // true'  2>/dev/null || echo "true")
     success=$(echo "${resp}" | jq -r '.success // false' 2>/dev/null || echo "false")
 
     if [[ "${active}" == "false" ]]; then
@@ -124,13 +175,25 @@ wait_for_command() {
       else
         msg=$(echo "${resp}" | jq -r '.resultMessage // "no message"' 2>/dev/null || echo "unknown")
         echo "[ERROR] Command ${cmd_id} failed: ${msg}" >&2
+        echo "${resp}" | jq -r '
+          .children.items[]?
+          | select(.success == false and .active == false)
+          | "[FAILED] \(.name // "") service=\(.serviceRef.serviceName // "-") msg=\(.resultMessage // "")"
+        ' 2>/dev/null || true
         return 1
       fi
     fi
 
     sleep "${interval}"
     waited=$((waited + interval))
-    echo "[INFO] Command ${cmd_id} still running (${waited}s elapsed) ..."
+
+    local progress
+    progress=$(_cmd_progress_line "${resp}") || true
+    if [[ -n "${progress}" ]]; then
+      echo "[INFO] ${waited}s | ${progress}"
+    else
+      echo "[INFO] ${waited}s | Command ${cmd_id} running ..."
+    fi
   done
 
   echo "[ERROR] Command ${cmd_id} timed out after ${max_wait}s." >&2
