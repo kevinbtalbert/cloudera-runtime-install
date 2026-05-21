@@ -145,31 +145,57 @@ if [[ "${CLUSTER_STATUS}" == "200" ]]; then
     sleep 15
     cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}" -X DELETE > /dev/null 2>&1 || true
   fi
+  # Query the actual HDFS directory paths from CM *before* we delete the cluster.
+  # CM stores dirs as comma-separated lists.  The values are set on the role
+  # config groups; we default to the CM-standard paths if a query fails.
+  echo "[INFO] Querying HDFS directory paths from CM ..."
+  _hdfs_nn_dirs=$(cm_curl \
+    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-NAMENODE-BASE/config" \
+    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_name_dir_list")) | .[0].value // "/dfs/nn"' \
+    2>/dev/null || echo "/dfs/nn")
+  _hdfs_snn_dirs=$(cm_curl \
+    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-SECONDARYNAMENODE-BASE/config" \
+    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="fs_checkpoint_dir_list")) | .[0].value // "/dfs/snn"' \
+    2>/dev/null || echo "/dfs/snn")
+  _hdfs_dn_dirs=$(cm_curl \
+    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/hdfs/roleConfigGroups/hdfs-DATANODE-BASE/config" \
+    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dfs_data_dir_list")) | .[0].value // "/dfs/dn"' \
+    2>/dev/null || echo "/dfs/dn")
+  echo "[INFO] HDFS NameNode dirs        : ${_hdfs_nn_dirs}"
+  echo "[INFO] HDFS SecondaryNameNode dirs: ${_hdfs_snn_dirs}"
+  echo "[INFO] HDFS DataNode dirs        : ${_hdfs_dn_dirs}"
+
   echo "[INFO] Stub cluster deleted."
 
   # Clean ALL HDFS on-disk state for a clean retry.
   #
   # When a previous import formatted the NameNode and then failed later (e.g.
-  # Kafka KRaft error), we end up with:
-  #   - NameNode dirs:  formatted with cluster ID X
-  #   - DataNode dirs:  VERSION files still referencing cluster ID X
-  # On retry, HDFS format creates a NEW cluster ID Y.  The DataNode then
-  # rejects the NameNode because X != Y and crashes ("Supervisor FATAL").
+  # Kafka issues), we end up with NameNode dirs formatted with cluster ID X and
+  # DataNode dirs with VERSION files also referencing cluster ID X.  On retry,
+  # HDFS format generates a NEW cluster ID Y — the DataNode then rejects the
+  # NameNode (X≠Y) and crashes ("Supervisor FATAL").
   #
-  # Fix: clean NameNode, Secondary NameNode, AND DataNode directories so all
-  # sides start fresh with the same new cluster ID after format.
+  # Fix: clean NN + SNN + DN together so all three get the same new cluster ID.
   # Safe here because we confirmed the cluster is a stub (CORE_SETTINGS only).
   echo "[INFO] Cleaning HDFS on-disk state (NN + SNN + DN) for clean retry ..."
-  for _hdfs_dir in \
-      "/dfs/nn" "/dfs/snn" "/dfs/dn" \
-      "/var/lib/hadoop-hdfs/cache/hdfs/dfs/namenode" \
-      "/var/lib/hadoop-hdfs/cache/hdfs/dfs/namesecondary" \
-      "/var/lib/hadoop-hdfs/cache/hdfs/dfs/data"; do
-    if [[ -d "${_hdfs_dir}" ]]; then
-      rm -rf "${_hdfs_dir}"
-      echo "[INFO]   Removed: ${_hdfs_dir}"
-    fi
-  done
+
+  _clean_hdfs_dirs() {
+    # Takes a comma-separated list of paths and removes each
+    local dir_list="$1"
+    IFS=',' read -ra _dirs <<< "${dir_list}"
+    for _d in "${_dirs[@]}"; do
+      _d="${_d// /}"   # trim spaces
+      [[ -z "${_d}" ]] && continue
+      if [[ -d "${_d}" ]]; then
+        rm -rf "${_d}"
+        echo "[INFO]   Removed: ${_d}"
+      fi
+    done
+  }
+
+  _clean_hdfs_dirs "${_hdfs_nn_dirs}"
+  _clean_hdfs_dirs "${_hdfs_snn_dirs}"
+  _clean_hdfs_dirs "${_hdfs_dn_dirs}"
 
   # Wait for CM to finish any residual parcel distribution that was started by
   # the previous import.  Parcel distribution runs against the hosts, not the
@@ -319,10 +345,37 @@ _recover_start_services() {
   done
 }
 
+_is_hdfs_already_formatted_failure() {
+  # Returns 0 if the import failed because HDFS namenode dirs are not empty
+  # (retry scenario where HDFS is already formatted from a previous run).
+  # In that case there is no point retrying the full import — go straight to
+  # _recover_start_services which starts services individually without format.
+  local cmd_id="$1"
+  local msg
+  msg=$(cm_curl "${CM_API_BASE}/commands/${cmd_id}" 2>/dev/null \
+    | jq -r '[.. | objects | .resultMessage? // empty] | join(" ")' \
+    2>/dev/null | head -c 2000)
+  echo "${msg}" | grep -qi "not formatting\|not empty\|already formatted\|data appears to exist" \
+    && return 0
+  return 1
+}
+
 RETRIES=0
 while true; do
   if wait_for_command "${CM_API_BASE}" "${CMD_ID}" 7200; then
     echo "[INFO] Cluster deployment succeeded."
+    break
+  fi
+
+  # Fast-path: if HDFS refused to format (dirs not empty from a previous
+  # deployment), retrying importClusterTemplate will always fail the same way.
+  # Skip straight to service-by-service recovery instead.
+  _SVC_COUNT_FAST=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services" \
+    | jq '[.items[] | select(.type != "CORE_SETTINGS")] | length' 2>/dev/null || echo "0")
+  if [[ "${_SVC_COUNT_FAST}" -gt 0 ]] && _is_hdfs_already_formatted_failure "${CMD_ID}"; then
+    echo "[WARN] HDFS already-formatted failure detected — skipping retries."
+    echo "[WARN] Starting services individually (bypasses HDFS re-format)."
+    _recover_start_services
     break
   fi
 
