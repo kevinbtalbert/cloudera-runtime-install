@@ -10,7 +10,7 @@
 #      MAX_IMPORT_RETRIES times).  CM's retry API re-attempts only the
 #      sub-commands that failed — services that already started are skipped.
 #   4. Restart Management Services after successful deployment
-#   5. Clear paywall credentials from CM
+
 #
 # Runs on the Cloudera Manager host.
 # ==============================================================================
@@ -407,44 +407,19 @@ _apply_kafka_fixes() {
 }
 
 _recover_start_services() {
-  echo "[INFO] Pre-start: applying Kafka config fixes ..."
+  echo "[INFO] Applying Kafka config fixes ..."
   _apply_kafka_fixes "${CM_API_BASE}" "${CLUSTER_ENCODED}"
 
-  # Start services in dependency order.  Per-service start (not firstRun)
-  # skips HDFS re-format and Kafka KRaft init — both fail when services
-  # already have data from a previous deployment attempt.
-  local services=(zookeeper hdfs yarn queuemanager hive hive_on_tez kafka impala hue nifi nifiregistry flink sql_stream_builder)
-
-  for svc in "${services[@]}"; do
-    local state
-    state=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/${svc}" \
-      | jq -r '.serviceState // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
-
-    case "${state}" in
-      STARTED)
-        echo "[INFO]   ${svc}: already STARTED"
-        ;;
-      STOPPED)
-        echo "[INFO]   ${svc}: starting ..."
-        local cmd_id
-        cmd_id=$(cm_curl \
-          "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/${svc}/commands/start" \
-          -X POST | jq -r '.id // empty' 2>/dev/null || true)
-        if [[ -n "${cmd_id}" ]]; then
-          wait_for_command "${CM_API_BASE}" "${cmd_id}" 300 || \
-            echo "[WARN]   ${svc} start did not complete cleanly — check CM UI"
-        else
-          echo "[WARN]   ${svc}: start command returned no ID"
-        fi
-        ;;
-      NA)
-        echo "[INFO]   ${svc}: NA (gateway-only, no start needed)"
-        ;;
-      *)
-        echo "[INFO]   ${svc}: state=${state} — skipping"
-        ;;
-    esac
-  done
+  echo "[INFO] Starting cluster (CM handles dependency order) ..."
+  local start_resp start_id
+  start_resp=$(cm_curl "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/commands/restart" -X POST)
+  start_id=$(echo "${start_resp}" | jq -r '.id // empty' 2>/dev/null || true)
+  if [[ -n "${start_id}" ]]; then
+    wait_for_command "${CM_API_BASE}" "${start_id}" 3600 || \
+      echo "[WARN] Cluster start did not complete cleanly — check CM UI."
+  else
+    echo "[WARN] Could not get cluster start command ID."
+  fi
 }
 
 _is_hdfs_already_formatted_failure() {
@@ -543,84 +518,6 @@ while true; do
 done
 
 # ---------------------------------------------------------------------------
-# Post-deploy: configure SQL Stream Builder database
-#
-# The SSB datasource property names are not known ahead of time — they vary
-# by CSD version and are not the same as the Spring Boot application keys.
-# We discover them by querying the STREAMING_SQL_ENGINE role config group
-# after it exists, find the DB-related properties, set them, then restart SSB.
-# ---------------------------------------------------------------------------
-
-echo "[INFO] Configuring SQL Stream Builder database ..."
-
-# SSB database configuration via service-level CM properties.
-# database_type, database_host, database_port, database_schema, database_user,
-# database_password are all exposed at the SQL_STREAM_BUILDER service level.
-# Also set the SSE application.properties and db-migration safety valves as
-# belt-and-suspenders for the UpdateAdminDatabase command.
-SSB_SVC_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/config"
-SSB_ROLE_GROUP="sql_stream_builder-STREAMING_SQL_ENGINE-BASE"
-SSB_ROLE_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/roleConfigGroups/${SSB_ROLE_GROUP}/config"
-MVE_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/roleConfigGroups/sql_stream_builder-MATERIALIZED_VIEW_ENGINE-BASE/config"
-
-echo "[INFO] Configuring SSB database ..."
-
-SSB_JDBC_URL="jdbc:postgresql://${DB_HOST}:${DB_PORT}/${SSB_DB_NAME}"
-
-# Service-level properties (the primary CM configuration for SSB database)
-cm_curl "${SSB_SVC_URL}" -X PUT -d "$(jq -n \
-  --arg host "${DB_HOST}" --arg port "${DB_PORT}" \
-  --arg name "${SSB_DB_NAME}" --arg user "${SSB_DB_USER}" --arg pass "${SSB_DB_PASS}" \
-  '{items:[
-    {name:"database_type",    value:"postgresql"},
-    {name:"database_host",    value:$host},
-    {name:"database_port",    value:$port},
-    {name:"database_schema",  value:$name},
-    {name:"database_user",    value:$user},
-    {name:"database_password",value:$pass}
-  ]}')" > /dev/null
-
-# Spring Boot safety valves for SSE (used by both the main app and admin-database.sh)
-SSB_SPRING_PROPS=$(python3 - "${SSB_JDBC_URL}" "${SSB_DB_USER}" "${SSB_DB_PASS}" <<'INNERPY'
-import json, sys
-jdbc_url, user, password = sys.argv[1:4]
-props = "\n".join([
-    f"spring.datasource.url={jdbc_url}",
-    f"spring.datasource.username={user}",
-    f"spring.datasource.password={password}",
-    "spring.datasource.driver-class-name=org.postgresql.Driver",
-])
-print(json.dumps({"items": [
-    {"name": "ssb-conf/application.properties_role_safety_valve",         "value": props},
-    {"name": "db-migration-conf/application.properties_role_safety_valve","value": props},
-]}))
-INNERPY
-)
-cm_curl "${SSB_ROLE_URL}" -X PUT -d "${SSB_SPRING_PROPS}" > /dev/null
-
-# MVE datasource properties
-cm_curl "${MVE_URL}" -X PUT -d "$(jq -n \
-  --arg url  "${SSB_JDBC_URL}" \
-  --arg user "${SSB_DB_USER}" \
-  --arg pass "${SSB_DB_PASS}" \
-  '{items:[
-    {name:"ssb.mve.datasource.url",     value:$url},
-    {name:"ssb.mve.datasource.username",value:$user},
-    {name:"ssb.mve.datasource.password",value:$pass}
-  ]}')" > /dev/null
-
-echo "[INFO] SSB database configured (${SSB_JDBC_URL})."
-echo "[INFO] Running SSB firstRun (database migration) ..."
-SSB_FR=$(cm_curl \
-  "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/commands/firstRun" \
-  -X POST)
-SSB_FR_ID=$(echo "${SSB_FR}" | jq -r '.id // empty' 2>/dev/null || true)
-if [[ -n "${SSB_FR_ID}" ]]; then
-  wait_for_command "${CM_API_BASE}" "${SSB_FR_ID}" 300 || \
-    echo "[WARN] SSB firstRun did not complete cleanly — check CM UI."
-fi
-
-# ---------------------------------------------------------------------------
 # Full cluster restart
 # Restarts all services in dependency order so everything comes up clean
 # after all configuration changes (Kafka metadata store, SSB database, etc.)
@@ -648,17 +545,6 @@ MGMT_ID=$(echo "${MGMT_RESP}" | jq -r '.id // empty' 2>/dev/null || true)
 if [[ -n "${MGMT_ID}" && "${MGMT_ID}" != "null" ]]; then
   wait_for_command "${CM_API_BASE}" "${MGMT_ID}" 300 || true
 fi
-
-# ---------------------------------------------------------------------------
-# Clear paywall credentials
-# ---------------------------------------------------------------------------
-
-echo "[INFO] Clearing paywall credentials from CM ..."
-cm_curl "${CM_API_BASE}/cm/config" -X PUT \
-  -d '{"items": [
-        {"name": "REMOTE_REPO_OVERRIDE_USER",     "value": ""},
-        {"name": "REMOTE_REPO_OVERRIDE_PASSWORD", "value": ""}
-      ]}' > /dev/null
 
 echo "[INFO] 05_deploy_cluster: complete."
 echo "[INFO] Run 06_validate_runtime.sh to verify service health."

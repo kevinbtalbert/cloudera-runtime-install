@@ -138,6 +138,9 @@ def label(c):
 
 if running:
     msg = f'{done_ok}/{total} done | running: {label(running[-1])}'
+elif done_ok == total and done_bad == 0:
+    # All children succeeded — parent command is finalizing (CM bookkeeping)
+    msg = f'{done_ok}/{total} done | finalizing ...'
 else:
     completed = sorted([c for c in items if not c.get('active')],
                        key=lambda c: c.get('endTime') or '')
@@ -165,7 +168,9 @@ wait_for_command() {
     local resp active success msg
     resp=$(cm_curl "${api_base}/commands/${cmd_id}") || true
 
-    active=$(echo "${resp}"  | jq -r '.active  // true'  2>/dev/null || echo "true")
+    # Map active: true=running, anything else (false/null)=done.
+    active=$(echo "${resp}" | jq -r 'if .active == true then "true" else "false" end' \
+             2>/dev/null || echo "true")
     success=$(echo "${resp}" | jq -r '.success // false' 2>/dev/null || echo "false")
 
     if [[ "${active}" == "false" ]]; then
@@ -191,8 +196,20 @@ wait_for_command() {
     progress=$(_cmd_progress_line "${resp}") || true
     if [[ -n "${progress}" ]]; then
       echo "[INFO] ${waited}s | ${progress}"
+      # If all children succeeded and we have been finalizing for 5+ minutes,
+      # CM is not going to update the parent command — treat as success.
+      if echo "${progress}" | grep -q "finalizing"; then
+        _FINALIZING_COUNT=$(( ${_FINALIZING_COUNT:-0} + 1 ))
+        if [[ "${_FINALIZING_COUNT}" -ge 5 ]]; then
+          echo "[INFO] All sub-commands complete; moving on."
+          return 0
+        fi
+      else
+        _FINALIZING_COUNT=0
+      fi
     else
       echo "[INFO] ${waited}s | Command ${cmd_id} running ..."
+      _FINALIZING_COUNT=0
     fi
   done
 
