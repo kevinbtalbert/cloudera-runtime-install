@@ -33,7 +33,8 @@
         "nifiregistry-NIFI_REGISTRY_SERVER-BASE",
         "flink-FLINK_HISTORY_SERVER-BASE",
         "flink-GATEWAY-BASE",
-        "sql_stream_builder-STREAMING_SQL_ENGINE-BASE"
+        "sql_stream_builder-STREAMING_SQL_ENGINE-BASE",
+        "sql_stream_builder-MATERIALIZED_VIEW_ENGINE-BASE"
       ]
     }
   ],
@@ -502,11 +503,42 @@
       "refName": "sql_stream_builder",
       "serviceType": "SQL_STREAM_BUILDER",
       "displayName": "SQL Stream Builder",
-      "serviceConfigs": [],
+      "serviceConfigs": [
+        {
+          "name": "database_type",
+          "value": "postgresql"
+        },
+        {
+          "name": "database_host",
+          "value": "${DB_HOST}"
+        },
+        {
+          "name": "database_port",
+          "value": "${DB_PORT}"
+        },
+        {
+          "name": "database_schema",
+          "value": "${SSB_DB_NAME}"
+        },
+        {
+          "name": "database_user",
+          "value": "${SSB_DB_USER}"
+        },
+        {
+          "name": "database_password",
+          "value": "${SSB_DB_PASS}"
+        }
+      ],
       "roleConfigGroups": [
         {
           "refName": "sql_stream_builder-STREAMING_SQL_ENGINE-BASE",
           "roleType": "STREAMING_SQL_ENGINE",
+          "base": true,
+          "configs": []
+        },
+        {
+          "refName": "sql_stream_builder-MATERIALIZED_VIEW_ENGINE-BASE",
+          "roleType": "MATERIALIZED_VIEW_ENGINE",
           "base": true,
           "configs": []
         }

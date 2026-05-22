@@ -197,16 +197,24 @@ echo "[INFO]   HDFS NN dirs:   ${_hdfs_nn_dirs}"
 echo "[INFO]   HDFS SNN dirs:  ${_hdfs_snn_dirs}"
 echo "[INFO]   HDFS DN dirs:   ${_hdfs_dn_dirs}"
 
-# ZooKeeper data dir (query from CM while cluster exists, else use default)
+# ZooKeeper and Kafka data dirs (query from CM while cluster exists, else use defaults)
 _zk_data_dir="/var/lib/zookeeper"
+_kafka_log_dirs="/var/local/kafka/data"
 if [[ "${CLUSTER_STATUS}" == "200" ]]; then
   _zk_data_dir_queried=$(cm_curl \
     "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/zookeeper/roleConfigGroups/zookeeper-SERVER-BASE/config" \
     2>/dev/null | jq -r '(.items//[]) | map(select(.name=="dataDir")) | .[0].value // ""' \
     2>/dev/null || echo "")
   [[ -n "${_zk_data_dir_queried}" ]] && _zk_data_dir="${_zk_data_dir_queried}"
+
+  _kafka_log_dirs_queried=$(cm_curl \
+    "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/kafka/roleConfigGroups/kafka-KAFKA_BROKER-BASE/config" \
+    2>/dev/null | jq -r '(.items//[]) | map(select(.name=="log.dirs")) | .[0].value // ""' \
+    2>/dev/null || echo "")
+  [[ -n "${_kafka_log_dirs_queried}" ]] && _kafka_log_dirs="${_kafka_log_dirs_queried}"
 fi
 echo "[INFO]   ZooKeeper data: ${_zk_data_dir}"
+echo "[INFO]   Kafka log.dirs: ${_kafka_log_dirs}"
 
 _needs_clean=false
 IFS=',' read -ra _nn_check_arr <<< "${_hdfs_nn_dirs}"
@@ -219,6 +227,18 @@ for _d in "${_nn_check_arr[@]}"; do
   fi
 done
 
+_recreate_db() {
+  # Drop and recreate a PostgreSQL database to clear stale migration/schema state.
+  local db_name="$1" db_owner="$2"
+  echo "[INFO]   Recreating database '${db_name}' (owner ${db_owner}) ..."
+  ( cd /tmp && sudo -u postgres psql -Atc \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${db_name}' AND pid<>pg_backend_pid();" \
+    2>/dev/null ) || true
+  ( cd /tmp && sudo -u postgres psql -c "DROP DATABASE IF EXISTS ${db_name};" 2>/dev/null ) || true
+  ( cd /tmp && sudo -u postgres psql -c \
+    "CREATE DATABASE ${db_name} OWNER ${db_owner} ENCODING 'UTF8';" 2>/dev/null ) || true
+}
+
 if [[ "${_needs_clean}" == "true" ]]; then
   _clean_hdfs_dirs "${_hdfs_nn_dirs}"
   _clean_hdfs_dirs "${_hdfs_snn_dirs}"
@@ -227,7 +247,22 @@ if [[ "${_needs_clean}" == "true" ]]; then
     rm -rf "${_zk_data_dir}"
     echo "[INFO]   Cleaned ZooKeeper: ${_zk_data_dir}"
   fi
-  echo "[INFO] On-disk state cleaned — ready for fresh import."
+  # Clean Kafka data dirs: after ZooKeeper is wiped, Kafka gets a new cluster ID.
+  # If the Kafka log.dirs contain old meta.properties with the previous cluster ID,
+  # Kafka refuses to start (cluster ID mismatch).  Must clean together with ZK.
+  _clean_hdfs_dirs "${_kafka_log_dirs}"
+  echo "[INFO]   Cleaned Kafka log.dirs: ${_kafka_log_dirs}"
+
+  # Recreate service databases to clear stale Django migration locks (Hue),
+  # stale schema state from NiFi Registry, Hive Metastore, and SSB.
+  # scm and rman are NOT recreated — CM server owns scm; rman is managed by CMS.
+  echo "[INFO] Recreating service databases to clear stale migration state ..."
+  _recreate_db "${HUE_DB_NAME}"  "${HUE_DB_USER}"
+  _recreate_db "${REG_DB_NAME}"  "${REG_DB_USER}"
+  _recreate_db "${HIVE_DB_NAME}" "${HIVE_DB_USER}"
+  _recreate_db "${SSB_DB_NAME}"  "${SSB_DB_USER}"
+
+  echo "[INFO] On-disk and database state cleaned — ready for fresh import."
 else
   echo "[INFO] On-disk state is clean."
 fi
@@ -480,70 +515,71 @@ done
 
 echo "[INFO] Configuring SQL Stream Builder database ..."
 
+# SSB database configuration via service-level CM properties.
+# database_type, database_host, database_port, database_schema, database_user,
+# database_password are all exposed at the SQL_STREAM_BUILDER service level.
+# Also set the SSE application.properties and db-migration safety valves as
+# belt-and-suspenders for the UpdateAdminDatabase command.
+SSB_SVC_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/config"
 SSB_ROLE_GROUP="sql_stream_builder-STREAMING_SQL_ENGINE-BASE"
-SSB_CONFIG_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/roleConfigGroups/${SSB_ROLE_GROUP}/config"
+SSB_ROLE_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/roleConfigGroups/${SSB_ROLE_GROUP}/config"
+MVE_URL="${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/roleConfigGroups/sql_stream_builder-MATERIALIZED_VIEW_ENGINE-BASE/config"
 
-# Discover which DB property names actually exist in this CSD version
-SSB_CONFIG_FULL=$(cm_curl "${SSB_CONFIG_URL}?view=full" 2>/dev/null || echo "")
+echo "[INFO] Configuring SSB database ..."
 
-SSB_DB_PROPS=$(echo "${SSB_CONFIG_FULL}" | jq -r '
-  .items[]?
-  | select(.name | test("datasource|database|jdbc|postgres"; "i"))
-  | .name
-' 2>/dev/null || echo "")
+SSB_JDBC_URL="jdbc:postgresql://${DB_HOST}:${DB_PORT}/${SSB_DB_NAME}"
 
-if [[ -z "${SSB_DB_PROPS}" ]]; then
-  echo "[WARN] No datasource/database properties found on ${SSB_ROLE_GROUP}."
-  echo "[WARN] SSB database must be configured manually in CM after deployment."
-  echo "[WARN] Available SSB role properties (first 20):"
-  echo "${SSB_CONFIG_FULL}" | jq -r '.items[].name' 2>/dev/null | head -20 | sed 's/^/[WARN]   /' || true
-else
-  echo "[INFO] Discovered SSB DB properties: $(echo "${SSB_DB_PROPS}" | tr '\n' ' ')"
+# Service-level properties (the primary CM configuration for SSB database)
+cm_curl "${SSB_SVC_URL}" -X PUT -d "$(jq -n \
+  --arg host "${DB_HOST}" --arg port "${DB_PORT}" \
+  --arg name "${SSB_DB_NAME}" --arg user "${SSB_DB_USER}" --arg pass "${SSB_DB_PASS}" \
+  '{items:[
+    {name:"database_type",    value:"postgresql"},
+    {name:"database_host",    value:$host},
+    {name:"database_port",    value:$port},
+    {name:"database_schema",  value:$name},
+    {name:"database_user",    value:$user},
+    {name:"database_password",value:$pass}
+  ]}')" > /dev/null
 
-  # Build config items dynamically from the discovered property names
-  SSB_CONFIG_ITEMS=$(echo "${SSB_DB_PROPS}" | python3 - \
-    "${DB_HOST}" "${DB_PORT}" "${SSB_DB_NAME}" "${SSB_DB_USER}" "${SSB_DB_PASS}" <<'PYEOF'
-import sys, json
+# Spring Boot safety valves for SSE (used by both the main app and admin-database.sh)
+SSB_SPRING_PROPS=$(python3 - "${SSB_JDBC_URL}" "${SSB_DB_USER}" "${SSB_DB_PASS}" <<'INNERPY'
+import json, sys
+jdbc_url, user, password = sys.argv[1:4]
+props = "\n".join([
+    f"spring.datasource.url={jdbc_url}",
+    f"spring.datasource.username={user}",
+    f"spring.datasource.password={password}",
+    "spring.datasource.driver-class-name=org.postgresql.Driver",
+])
+print(json.dumps({"items": [
+    {"name": "ssb-conf/application.properties_role_safety_valve",         "value": props},
+    {"name": "db-migration-conf/application.properties_role_safety_valve","value": props},
+]}))
+INNERPY
+)
+cm_curl "${SSB_ROLE_URL}" -X PUT -d "${SSB_SPRING_PROPS}" > /dev/null
 
-props = sys.stdin.read().split()
-host, port, dbname, user, password = sys.argv[1:6]
-jdbc_url = f"jdbc:postgresql://{host}:{port}/{dbname}"
+# MVE datasource properties
+cm_curl "${MVE_URL}" -X PUT -d "$(jq -n \
+  --arg url  "${SSB_JDBC_URL}" \
+  --arg user "${SSB_DB_USER}" \
+  --arg pass "${SSB_DB_PASS}" \
+  '{items:[
+    {name:"ssb.mve.datasource.url",     value:$url},
+    {name:"ssb.mve.datasource.username",value:$user},
+    {name:"ssb.mve.datasource.password",value:$pass}
+  ]}')" > /dev/null
 
-mapping = {}
-for p in props:
-    pl = p.lower()
-    if 'url'      in pl: mapping[p] = jdbc_url
-    elif 'user'   in pl and 'password' not in pl: mapping[p] = user
-    elif 'pass'   in pl: mapping[p] = password
-    elif 'name'   in pl or 'database' in pl: mapping[p] = dbname
-    elif 'host'   in pl: mapping[p] = host
-    elif 'port'   in pl: mapping[p] = port
-    elif 'driver' in pl: mapping[p] = "org.postgresql.Driver"
-
-items = [{"name": k, "value": v} for k, v in mapping.items()]
-print(json.dumps({"items": items}))
-PYEOF
-  )
-
-  echo "[INFO] Setting SSB database config ..."
-  SSB_SET_RESP=$(cm_curl "${SSB_CONFIG_URL}" -X PUT -d "${SSB_CONFIG_ITEMS}")
-
-  if echo "${SSB_SET_RESP}" | jq -e '.message' &>/dev/null; then
-    echo "[WARN] SSB database config response: $(echo "${SSB_SET_RESP}" | jq -r '.message')"
-  else
-    echo "[INFO] SSB database configured."
-
-    # Restart SSB so it picks up the new datasource settings
-    echo "[INFO] Restarting SQL Stream Builder ..."
-    SSB_RESTART=$(cm_curl \
-      "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/commands/restart" \
-      -X POST)
-    SSB_RESTART_ID=$(echo "${SSB_RESTART}" | jq -r '.id // empty' 2>/dev/null || true)
-    if [[ -n "${SSB_RESTART_ID}" ]]; then
-      wait_for_command "${CM_API_BASE}" "${SSB_RESTART_ID}" 300 || \
-        echo "[WARN] SSB restart did not complete cleanly — check CM UI."
-    fi
-  fi
+echo "[INFO] SSB database configured (${SSB_JDBC_URL})."
+echo "[INFO] Running SSB firstRun (database migration) ..."
+SSB_FR=$(cm_curl \
+  "${CM_API_BASE}/clusters/${CLUSTER_ENCODED}/services/sql_stream_builder/commands/firstRun" \
+  -X POST)
+SSB_FR_ID=$(echo "${SSB_FR}" | jq -r '.id // empty' 2>/dev/null || true)
+if [[ -n "${SSB_FR_ID}" ]]; then
+  wait_for_command "${CM_API_BASE}" "${SSB_FR_ID}" 300 || \
+    echo "[WARN] SSB firstRun did not complete cleanly — check CM UI."
 fi
 
 # ---------------------------------------------------------------------------
