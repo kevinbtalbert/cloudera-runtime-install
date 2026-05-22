@@ -540,7 +540,20 @@
           "refName": "sql_stream_builder-MATERIALIZED_VIEW_ENGINE-BASE",
           "roleType": "MATERIALIZED_VIEW_ENGINE",
           "base": true,
-          "configs": []
+          "configs": [
+            {
+              "name": "ssb.mve.datasource.url",
+              "value": "jdbc:postgresql://${DB_HOST}:${DB_PORT}/${SSB_DB_NAME}"
+            },
+            {
+              "name": "ssb.mve.datasource.username",
+              "value": "${SSB_DB_USER}"
+            },
+            {
+              "name": "ssb.mve.datasource.password",
+              "value": "${SSB_DB_PASS}"
+            }
+          ]
         }
       ]
     }

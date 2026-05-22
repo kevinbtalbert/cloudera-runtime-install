@@ -95,6 +95,30 @@ SUBST_VARS='${CLUSTER_NAME}${CLUSTER_HOST}${CDH_VERSION}${CDH_BUILD}${CDH_PARCEL
 
 envsubst "${SUBST_VARS}" < "${TEMPLATE_FILE}" > "${GENERATED_TEMPLATE}"
 
+# Post-process: strip excluded services/products/repos based on feature flags
+echo "[INFO] Feature flags: INCLUDE_NIFI=${INCLUDE_NIFI:-true}  INCLUDE_SSB_FLINK=${INCLUDE_SSB_FLINK:-true}"
+python3 - "${GENERATED_TEMPLATE}" "${INCLUDE_NIFI:-true}" "${INCLUDE_SSB_FLINK:-true}" <<'FILTER_PY'
+import json, sys
+tmpl, inc_nifi, inc_ssb = sys.argv[1], sys.argv[2].lower()=='true', sys.argv[3].lower()=='true'
+with open(tmpl) as f: d = json.load(f)
+excl_types = set()
+excl_prod  = set()
+if not inc_nifi: excl_types |= {'NIFI','NIFIREGISTRY'}; excl_prod.add('CFM')
+if not inc_ssb:  excl_types |= {'FLINK','SQL_STREAM_BUILDER'}; excl_prod.add('FLINK')
+if not excl_types: sys.exit(0)
+excl_refs = {rg['refName'] for s in d.get('services',[]) if s.get('serviceType') in excl_types
+             for rg in s.get('roleConfigGroups',[])}
+d['services']    = [s for s in d.get('services',[])    if s.get('serviceType') not in excl_types]
+d['products']    = [p for p in d.get('products',[])    if p.get('product')     not in excl_prod]
+d['repositories']= [r for r in d.get('repositories',[])
+                    if not(not inc_nifi and 'cfm' in r.lower())
+                    if not(not inc_ssb  and '/csa/' in r.lower())]
+for ht in d.get('hostTemplates',[]):
+    ht['roleConfigGroupsRefNames']=[r for r in ht.get('roleConfigGroupsRefNames',[]) if r not in excl_refs]
+with open(tmpl,'w') as f: json.dump(d,f,indent=2)
+print('[INFO] Removed services:', ', '.join(sorted(excl_types)))
+FILTER_PY
+
 if ! jq . "${GENERATED_TEMPLATE}" > /dev/null 2>&1; then
   echo "[ERROR] Generated template is not valid JSON." >&2; exit 1
 fi
@@ -253,14 +277,28 @@ if [[ "${_needs_clean}" == "true" ]]; then
   _clean_hdfs_dirs "${_kafka_log_dirs}"
   echo "[INFO]   Cleaned Kafka log.dirs: ${_kafka_log_dirs}"
 
+  # Clean Queue Manager H2 fallback database.
+  # The YARN Queue Manager Store uses a jceks-encrypted PostgreSQL password.
+  # When jceks decryption fails it falls back to an embedded H2 database at
+  # /var/lib/hadoop-yarn/config-service.mv.db  If that file exists from a
+  # previous deployment with a different password the service crashes with
+  # "Wrong user name or password [28000]".
+  for _qm_h2 in "/var/lib/hadoop-yarn/config-service.mv.db" \
+                "/var/lib/hadoop-yarn/config-service.trace.db"; do
+    if [[ -f "${_qm_h2}" ]]; then
+      rm -f "${_qm_h2}"
+      echo "[INFO]   Cleaned QueueManager H2: ${_qm_h2}"
+    fi
+  done
+
   # Recreate service databases to clear stale Django migration locks (Hue),
   # stale schema state from NiFi Registry, Hive Metastore, and SSB.
   # scm and rman are NOT recreated — CM server owns scm; rman is managed by CMS.
   echo "[INFO] Recreating service databases to clear stale migration state ..."
   _recreate_db "${HUE_DB_NAME}"  "${HUE_DB_USER}"
-  _recreate_db "${REG_DB_NAME}"  "${REG_DB_USER}"
+  [[ "${INCLUDE_NIFI:-true}"     == "true" ]] && _recreate_db "${REG_DB_NAME}"  "${REG_DB_USER}"
   _recreate_db "${HIVE_DB_NAME}" "${HIVE_DB_USER}"
-  _recreate_db "${SSB_DB_NAME}"  "${SSB_DB_USER}"
+  [[ "${INCLUDE_SSB_FLINK:-true}" == "true" ]] && _recreate_db "${SSB_DB_NAME}" "${SSB_DB_USER}"
 
   echo "[INFO] On-disk and database state cleaned — ready for fresh import."
 else

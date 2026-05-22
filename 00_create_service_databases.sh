@@ -47,6 +47,32 @@ if ! systemctl is-active --quiet "${PG_SERVICE}"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Increase PostgreSQL max_connections
+#
+# Default max_connections is 100.  When all cluster services start at once
+# (cluster restart) they open connection pools of 5-10 each and exhaust the
+# limit, causing:
+#   FATAL: remaining connection slots are reserved for non-replication
+#          superuser connections
+# NiFi Registry, Hue, SSB, Hive all connect simultaneously during the
+# post-deploy cluster restart.  300 comfortably handles all service pools.
+# ---------------------------------------------------------------------------
+
+CURRENT_MAX=$( ( cd /tmp && sudo -u postgres psql -Atc "SHOW max_connections;" ) 2>/dev/null || echo "100")
+echo "[INFO] PostgreSQL current max_connections: ${CURRENT_MAX}"
+
+if [[ "${CURRENT_MAX}" -lt 200 ]]; then
+  echo "[INFO] Increasing max_connections to 300 ..."
+  ( cd /tmp && sudo -u postgres psql -c "ALTER SYSTEM SET max_connections = 300;" ) 2>/dev/null
+  systemctl restart "${PG_SERVICE}"
+  sleep 5
+  NEW_MAX=$( ( cd /tmp && sudo -u postgres psql -Atc "SHOW max_connections;" ) 2>/dev/null || echo "unknown")
+  echo "[INFO] PostgreSQL max_connections is now: ${NEW_MAX}"
+else
+  echo "[INFO] max_connections already >= 200 — no change needed."
+fi
+
+# ---------------------------------------------------------------------------
 # Helper: create role + database if they do not already exist.
 # Uses -Atc (unaligned, tuples-only) for a clean empty-or-1 result.
 # ---------------------------------------------------------------------------
@@ -110,10 +136,14 @@ create_db "${RM_DB_NAME}" "${RM_DB_USER}" "${RM_DB_PASS}"
 # ---------------------------------------------------------------------------
 
 echo "[INFO] --- NiFi Registry (${REG_DB_NAME:-nifireg}) ---"
-: "${REG_DB_NAME:?REG_DB_NAME must be set — check parent EXPORTS}"
-: "${REG_DB_USER:?REG_DB_USER must be set — check parent EXPORTS}"
-: "${REG_DB_PASS:?REG_DB_PASS must be set — check parent EXPORTS}"
-create_db "${REG_DB_NAME}" "${REG_DB_USER}" "${REG_DB_PASS}"
+if [[ "${INCLUDE_NIFI:-true}" == "true" ]]; then
+  : "${REG_DB_NAME:?REG_DB_NAME must be set — check parent EXPORTS}"
+  : "${REG_DB_USER:?REG_DB_USER must be set — check parent EXPORTS}"
+  : "${REG_DB_PASS:?REG_DB_PASS must be set — check parent EXPORTS}"
+  create_db "${REG_DB_NAME}" "${REG_DB_USER}" "${REG_DB_PASS}"
+else
+  echo "[INFO]   skipped (INCLUDE_NIFI=false)"
+fi
 
 # ---------------------------------------------------------------------------
 # Hive Metastore
@@ -144,10 +174,14 @@ create_db "${HUE_DB_NAME}" "${HUE_DB_USER}" "${HUE_DB_PASS}"
 # ---------------------------------------------------------------------------
 
 echo "[INFO] --- SQL Stream Builder (${SSB_DB_NAME:-ssb}) ---"
-: "${SSB_DB_NAME:?SSB_DB_NAME must be set in EXPORTS}"
-: "${SSB_DB_USER:?SSB_DB_USER must be set in EXPORTS}"
-: "${SSB_DB_PASS:?SSB_DB_PASS must be set in EXPORTS}"
-create_db "${SSB_DB_NAME}" "${SSB_DB_USER}" "${SSB_DB_PASS}"
+if [[ "${INCLUDE_SSB_FLINK:-true}" == "true" ]]; then
+  : "${SSB_DB_NAME:?SSB_DB_NAME must be set in EXPORTS}"
+  : "${SSB_DB_USER:?SSB_DB_USER must be set in EXPORTS}"
+  : "${SSB_DB_PASS:?SSB_DB_PASS must be set in EXPORTS}"
+  create_db "${SSB_DB_NAME}" "${SSB_DB_USER}" "${SSB_DB_PASS}"
+else
+  echo "[INFO]   skipped (INCLUDE_SSB_FLINK=false)"
+fi
 
 # ---------------------------------------------------------------------------
 # Ranger (optional)

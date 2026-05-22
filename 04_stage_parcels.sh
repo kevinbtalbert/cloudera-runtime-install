@@ -166,9 +166,19 @@ PYEOF
 # Stage all three parcels
 # ---------------------------------------------------------------------------
 
-stage_parcel "CDH"   "${CDH_BUILD}"        "${CDH_PARCEL_REPO}"
-stage_parcel "CFM"   "${CFM_BUILD}"        "${CFM_PARCEL_REPO_URL}"
-stage_parcel "FLINK" "${CSA_FLINK_BUILD}"  "${CSA_PARCEL_REPO}"
+stage_parcel "CDH" "${CDH_BUILD}" "${CDH_PARCEL_REPO}"
+
+if [[ "${INCLUDE_NIFI:-true}" == "true" ]]; then
+  stage_parcel "CFM" "${CFM_BUILD}" "${CFM_PARCEL_REPO_URL}"
+else
+  echo "[INFO] Skipping CFM parcel (INCLUDE_NIFI=false)"
+fi
+
+if [[ "${INCLUDE_SSB_FLINK:-true}" == "true" ]]; then
+  stage_parcel "FLINK" "${CSA_FLINK_BUILD}" "${CSA_PARCEL_REPO}"
+else
+  echo "[INFO] Skipping FLINK parcel (INCLUDE_SSB_FLINK=false)"
+fi
 
 # ---------------------------------------------------------------------------
 # Fix ownership so CM agent can read the parcel-repo

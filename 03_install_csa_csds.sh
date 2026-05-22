@@ -25,6 +25,11 @@ require_cmd curl
 # Validate prerequisites
 # ---------------------------------------------------------------------------
 
+if [[ "${INCLUDE_SSB_FLINK:-true}" != "true" ]]; then
+  echo "[INFO] INCLUDE_SSB_FLINK=false — skipping CSA CSD installation."
+  exit 0
+fi
+
 : "${CLOUDERA_REPO_USER:?CLOUDERA_REPO_USER must be set in EXPORTS}"
 : "${CLOUDERA_REPO_PASS:?CLOUDERA_REPO_PASS must be set in EXPORTS}"
 : "${CSA_CSD_BASE_URL:?CSA_CSD_BASE_URL must be set in EXPORTS}"

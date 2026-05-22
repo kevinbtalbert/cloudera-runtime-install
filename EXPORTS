@@ -89,6 +89,19 @@ export SSB_DB_NAME='ssb'
 export SSB_DB_USER='ssb'
 export SSB_DB_PASS='SSB_DB_2026'
 
+# ---- Feature flags ----
+# Set either flag to 'false' to exclude that product from the deployment.
+# When false the associated parcels, CSDs, and cluster template services
+# are skipped entirely.
+#
+# INCLUDE_NIFI=false  → skips NiFi, NiFi Registry, CFM parcel download,
+#                        CFM CSD installation, and the nifireg database.
+#
+# INCLUDE_SSB_FLINK=false → skips Flink, SQL Stream Builder, CSA parcel
+#                           download, CSA CSD installation, and the ssb database.
+export INCLUDE_NIFI='true'
+export INCLUDE_SSB_FLINK='true'
+
 # ---- Logging ----
 # Inherits LOG_DIR from parent EXPORTS (/var/log/cloudera-bootstrap).
 export LOG_DIR="${LOG_DIR:-/var/log/cloudera-bootstrap}"
